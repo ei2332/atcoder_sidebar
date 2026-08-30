@@ -64,7 +64,7 @@ new MyACS().ACSinit();
 
 ## ライセンス
 
-[MIT License](LICENSE.md) で公開しています。
+[MIT License](LICENSE) で公開しています。
 
 本ソフトウェアは現状のまま、無保証で提供されます。利用によって生じた損害について、
 作者は責任を負いません。

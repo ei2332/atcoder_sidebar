@@ -2,7 +2,7 @@
 // @name         AtCoder Sidebar
 // @name:ja      AtCoder サイドバー
 // @namespace    https://github.com/ei2332
-// @version      1.0.0
+// @version      1.1.0
 // @description  Displays favorite-user standings and problem statistics in an extensible sidebar on AtCoder contest pages.
 // @description:ja AtCoderのコンテストページに、拡張可能な順位表・問題統計サイドバーを表示します。
 // @match        https://atcoder.jp/contests/*
@@ -243,6 +243,13 @@ const SIDEBAR_CSS = `
         overflow: hidden;
         text-align: left !important;
         text-overflow: ellipsis;
+    }
+
+    .acs-performance {
+        width: 58px;
+        min-width: 58px;
+        font-weight: bold;
+        font-variant-numeric: tabular-nums;
     }
 
     .acs-status-ac { color: #009900; font-weight: bold; }
@@ -491,6 +498,7 @@ class StandingsProcessor {
         const taskInfo = raw.TaskInfo || [];
         const standingsData = raw.StandingsData || [];
         const currentUserData = standingsData.find(row => row.UserScreenName === currentUser) ?? null;
+        const predictPerformance = this.createPerformancePredictor(standingsData);
 
         return {
             taskMeta: taskInfo.map(task => ({
@@ -503,6 +511,7 @@ class StandingsProcessor {
                 standingsData,
                 currentUser,
                 favoriteUsers,
+                predictPerformance,
             ),
             fixed: raw.Fixed === true,
             hasPendingSubmission: Object.values(currentUserData?.TaskResults || {})
@@ -534,7 +543,13 @@ class StandingsProcessor {
         });
     }
 
-    buildFavoriteStandings(taskInfo, standingsData, currentUser, favoriteUsers) {
+    buildFavoriteStandings(
+        taskInfo,
+        standingsData,
+        currentUser,
+        favoriteUsers,
+        predictPerformance,
+    ) {
         const taskNames = taskInfo.map(task => task.TaskScreenName);
         return standingsData
             .filter(row => !row.UserIsDeleted && favoriteUsers.has(row.UserScreenName))
@@ -542,11 +557,45 @@ class StandingsProcessor {
                 rank: row.Rank,
                 user: row.UserScreenName,
                 isCurrentUser: row.UserScreenName === currentUser,
+                predictedPerformance: predictPerformance(row.Rank),
                 results: Object.fromEntries(taskNames.map(taskName => [
                     taskName,
                     this.getSubmissionStatus(row.TaskResults?.[taskName]),
                 ])),
             }));
+    }
+
+    createPerformancePredictor(standingsData) {
+        const participantRatings = standingsData
+            .filter(row => (
+                !row.UserIsDeleted
+                && row.IsRated !== false
+                && Number.isFinite(row.Rating)
+                && row.Competitions > 0
+            ))
+            .map(row => this.calculateInnerRating(Math.max(row.Rating, 1), row.Competitions));
+        const predictions = new Map();
+
+        return rank => {
+            if (!Number.isFinite(rank) || participantRatings.length === 0) return null;
+            if (predictions.has(rank)) return predictions.get(rank);
+
+            let lower = -10000;
+            let upper = 10000;
+            for (let iteration = 0; iteration < 60; iteration++) {
+                const performance = (lower + upper) / 2;
+                const expectedRank = 0.5 + participantRatings.reduce(
+                    (sum, rating) => sum + 1 / (1 + Math.pow(6, (performance - rating) / 400)),
+                    0,
+                );
+                if (expectedRank > rank) lower = performance;
+                else upper = performance;
+            }
+
+            const prediction = Math.round((lower + upper) / 2);
+            predictions.set(rank, prediction);
+            return prediction;
+        };
     }
 
     getSubmissionStatus(result) {
@@ -1034,6 +1083,13 @@ function createRatingBar(ratings) {
     return bar;
 }
 
+function getRatingColor(rating) {
+    for (let index = RATING_BANDS.length - 1; index >= 0; index--) {
+        if (rating >= RATING_BANDS[index].minimum) return RATING_BANDS[index].color;
+    }
+    return RATING_BANDS[0].color;
+}
+
 function createStandingsPanel() {
     return {
         id: 'standings',
@@ -1059,11 +1115,17 @@ function createStandingsPanel() {
                 cell.style.width = '28px';
                 headerRow.appendChild(cell);
             });
+            const performanceHeader = createElement('th', {
+                className: 'acs-performance',
+                text: '予測Perf',
+            });
+            performanceHeader.title = '現在順位とRated参加者のレートから推定したパフォーマンス';
+            headerRow.appendChild(performanceHeader);
 
             const body = table.createTBody();
             if (cache.standings.length === 0) {
                 const cell = body.insertRow().insertCell();
-                cell.colSpan = 2 + taskMeta.length;
+                cell.colSpan = 3 + taskMeta.length;
                 cell.appendChild(createMessage('お気に入りユーザーがいません'));
                 return table;
             }
@@ -1101,6 +1163,15 @@ function createStandingsPanel() {
                         cell.textContent = '-';
                     }
                 });
+
+                const performance = standing.predictedPerformance;
+                const performanceCell = row.insertCell();
+                performanceCell.className = 'acs-performance';
+                performanceCell.textContent = Number.isFinite(performance) ? performance : '-';
+                performanceCell.title = '予測パフォーマンス';
+                if (Number.isFinite(performance)) {
+                    performanceCell.style.color = getRatingColor(performance);
+                }
             });
             return table;
         },

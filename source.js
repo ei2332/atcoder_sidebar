@@ -2,9 +2,9 @@
 // @name         AtCoder Sidebar
 // @name:ja      AtCoder サイドバー
 // @namespace    https://github.com/ei2332
-// @version      1.0.0
-// @description  Displays favorite-user standings and problem statistics in an extensible sidebar on AtCoder contest pages.
-// @description:ja AtCoderのコンテストページに、拡張可能な順位表・問題統計サイドバーを表示します。
+// @version      1.2.10
+// @description  Displays favorite-user standings, problem statistics, and real-time difficulty predictions in an extensible sidebar on AtCoder contest pages.
+// @description:ja AtCoderのコンテストページに、順位表・問題統計・リアルタイム難易度予想を表示します。
 // @match        https://atcoder.jp/contests/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -32,6 +32,7 @@ const DEFAULT_CONFIG = {
 };
 
 const CACHE_TTL = 30 * 60 * 1000;
+const DIFFICULTY_MODEL_VERSION = 3;
 
 const RATING_BANDS = [
     {label: '灰', minimum: -Infinity, color: '#808080'},
@@ -189,16 +190,33 @@ const SIDEBAR_CSS = `
     }
 
     .acs-rate-bar {
+        position: relative;
         display: flex;
         width: 100%;
         height: 10px;
         overflow: hidden;
+        background: #eee;
         border-radius: 2px;
     }
 
-    .acs-rate-bar > span {
+    .acs-rate-segment {
         display: block;
         height: 100%;
+    }
+
+    .acs-rate-bar.is-low-sample .acs-rate-segment {
+        opacity: 0.4;
+    }
+
+    .acs-difficulty-marker {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        z-index: 1;
+        width: 2px;
+        background: #111;
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.9);
+        transform: translateX(-1px);
     }
 
     .acs-standings-table {
@@ -487,17 +505,25 @@ class AtCoderClient {
 }
 
 class StandingsProcessor {
-    process(raw, currentUser, favoriteUsers) {
+    process(raw, currentUser, favoriteUsers, contestId) {
         const taskInfo = raw.TaskInfo || [];
         const standingsData = raw.StandingsData || [];
         const currentUserData = standingsData.find(row => row.UserScreenName === currentUser) ?? null;
+        const useOldRatings = raw.Fixed === true
+            && standingsData.some(row => Number(row.OldRating) > 0);
 
         return {
             taskMeta: taskInfo.map(task => ({
                 name: task.TaskScreenName,
                 assignment: task.Assignment,
             })),
-            tasks: this.buildTaskStats(taskInfo, standingsData, currentUserData),
+            tasks: this.buildTaskStats(
+                taskInfo,
+                standingsData,
+                currentUserData,
+                contestId,
+                useOldRatings,
+            ),
             standings: this.buildFavoriteStandings(
                 taskInfo,
                 standingsData,
@@ -510,26 +536,43 @@ class StandingsProcessor {
         };
     }
 
-    buildTaskStats(taskInfo, standingsData, currentUserData) {
+    buildTaskStats(taskInfo, standingsData, currentUserData, contestId, useOldRatings = false) {
+        const participantRows = standingsData.filter(row => this.hasParticipated(row));
+        const defaultInnerRating = this.getDefaultInnerRating(contestId);
+        const participantRatings = participantRows.map(row => (
+            this.getParticipantInnerRating(row, defaultInnerRating, useOldRatings)
+        ));
+
         return taskInfo.map(task => {
             const taskName = task.TaskScreenName;
-            const validRows = standingsData.filter(row => !row.UserIsDeleted && row.TaskResults?.[taskName]);
-            const results = validRows.map(row => row.TaskResults[taskName]);
-            const maximumScore = results.reduce((maximum, result) => Math.max(maximum, result.Score), 0);
-
-            const ratings = maximumScore > 0
-                ? validRows
-                    .filter(row => row.Competitions > 0 && row.TaskResults[taskName].Score === maximumScore)
-                    .map(row => this.calculateInnerRating(Math.max(row.Rating, 1), row.Competitions))
-                    .sort((left, right) => left - right)
+            const maximumScore = participantRows.reduce((maximum, row) => (
+                Math.max(maximum, Number(row.TaskResults?.[taskName]?.Score) || 0)
+            ), 0);
+            const acceptedRows = maximumScore > 0
+                ? participantRows.filter(row => (
+                    Number(row.TaskResults?.[taskName]?.Score) === maximumScore
+                ))
                 : [];
+            const ratings = acceptedRows
+                .map(row => this.getParticipantInnerRating(
+                    row,
+                    defaultInnerRating,
+                    useOldRatings,
+                ))
+                .sort((left, right) => left - right);
+            const difficulty = acceptedRows.length > 0
+                ? this.predictDifficulty(participantRatings, ratings.length)
+                : null;
 
             return {
                 name: taskName,
                 assignment: task.Assignment,
-                acCount: results.filter(result => result.Status === 1).length,
+                acCount: acceptedRows.length,
                 ratings,
-                solvedByCurrentUser: currentUserData?.TaskResults?.[taskName]?.Status === 1,
+                predictedDifficulty: difficulty?.displayRating ?? null,
+                predictedInnerDifficulty: difficulty?.innerRating ?? null,
+                solvedByCurrentUser: maximumScore > 0
+                    && Number(currentUserData?.TaskResults?.[taskName]?.Score) === maximumScore,
             };
         });
     }
@@ -566,6 +609,63 @@ class StandingsProcessor {
             - 1
         ) / (Math.sqrt(19) - 1);
         return normalizedRating + competitionAdjustment;
+    }
+
+    hasParticipated(row) {
+        if (row.UserIsDeleted || !row.TaskResults) return false;
+        if (Number(row.TotalResult?.Count) > 0) return true;
+
+        return Object.values(row.TaskResults).some(result => result && (
+            Number(result.Score) > 0
+            || Number(result.Count) > 0
+            || Number(result.Failure) > 0
+            || result.Pending === true
+        ));
+    }
+
+    getParticipantInnerRating(row, defaultInnerRating, useOldRating = false) {
+        const rating = Number(useOldRating ? row.OldRating : row.Rating);
+        const competitions = Number(row.Competitions);
+        if (!Number.isFinite(rating) || rating <= 0 || !Number.isFinite(competitions) || competitions <= 0) {
+            return defaultInnerRating;
+        }
+        return this.calculateInnerRating(Math.max(rating, 1), competitions);
+    }
+
+    getDefaultInnerRating(contestId = '') {
+        const match = String(contestId).match(/^(abc|arc|agc)(\d{3,})$/i);
+        if (!match) return 800;
+
+        const contestType = match[1].toLowerCase();
+        const contestNumber = Number(match[2]);
+        if (contestType === 'abc') return contestNumber >= 430 ? 1200 : 800;
+        if (contestType === 'arc') return contestNumber >= 104 ? 1000 : 1600;
+        return contestNumber >= 34 ? 1200 : 1600;
+    }
+
+    predictDifficulty(participantRatings, acceptedCount) {
+        if (participantRatings.length === 0 || acceptedCount <= 0) return null;
+
+        // 各参加者の予測正解確率の合計が実際の正解者数になる難易度を求める。
+        let lower = -10000;
+        let upper = 10000;
+        while (upper - lower > 1) {
+            const middle = Math.floor((lower + upper) / 2);
+            const expectedAcceptedCount = participantRatings.reduce((sum, rating) => (
+                sum + 1 / (1 + Math.pow(6, (middle - rating) / 400))
+            ), 0);
+
+            if (expectedAcceptedCount < acceptedCount) upper = middle;
+            else lower = middle;
+        }
+
+        const displayRating = lower >= 400
+            ? lower
+            : 400 / Math.exp(1 - lower / 400);
+        return {
+            innerRating: lower,
+            displayRating: Math.round(displayRating),
+        };
     }
 }
 
@@ -891,12 +991,16 @@ class AtCoderSidebarApp {
         this.view.renderAll();
 
         document.addEventListener('visibilitychange', () => this.handleVisibilityChange());
-        if (!document.hidden && !this.cache.fixed) this.fetchAndUpdate();
+        const forceRefresh = this.needsDifficultyRefresh();
+        if (!document.hidden && (!this.cache.fixed || forceRefresh)) {
+            this.fetchAndUpdate(forceRefresh);
+        }
     }
 
     createEmptyCache() {
         return {
             contestId: this.contestId,
+            difficultyModelVersion: DIFFICULTY_MODEL_VERSION,
             updatedAt: Date.now(),
             taskMeta: null,
             tasks: null,
@@ -929,8 +1033,13 @@ class AtCoderSidebarApp {
         this.storage.saveUiState({...current, ...change});
     }
 
-    async fetchAndUpdate() {
-        if (document.hidden || this.cache.fixed || this.updateInProgress) return;
+    needsDifficultyRefresh() {
+        return Array.isArray(this.cache?.tasks)
+            && this.cache.difficultyModelVersion !== DIFFICULTY_MODEL_VERSION;
+    }
+
+    async fetchAndUpdate(force = false) {
+        if (document.hidden || (this.cache.fixed && !force) || this.updateInProgress) return;
         this.clearUpdateTimer();
         this.updateInProgress = true;
 
@@ -942,11 +1051,13 @@ class AtCoderSidebarApp {
                 raw,
                 this.currentUser,
                 favoriteUsers,
+                this.contestId,
             );
 
             this.latestRawStandings = raw;
             this.cache = {
                 contestId: this.contestId,
+                difficultyModelVersion: DIFFICULTY_MODEL_VERSION,
                 updatedAt: Date.now(),
                 ...processed,
             };
@@ -962,7 +1073,7 @@ class AtCoderSidebarApp {
             }
         } catch (error) {
             console.error('[AtCoder Sidebar] Failed to update standings.', error);
-            this.scheduleUpdate(10 * 1000);
+            this.scheduleUpdate(10 * 1000, force);
         } finally {
             this.updateInProgress = false;
         }
@@ -980,15 +1091,16 @@ class AtCoderSidebarApp {
             this.cache = freshCache;
             this.view.renderAll();
         }
-        if (!this.cache.fixed) this.fetchAndUpdate();
+        const forceRefresh = this.needsDifficultyRefresh();
+        if (!this.cache.fixed || forceRefresh) this.fetchAndUpdate(forceRefresh);
     }
 
-    scheduleUpdate(delay) {
-        if (document.hidden || this.cache.fixed) return;
+    scheduleUpdate(delay, force = false) {
+        if (document.hidden || (this.cache.fixed && !force)) return;
         this.clearUpdateTimer();
         this.updateTimer = setTimeout(() => {
             this.updateTimer = null;
-            this.fetchAndUpdate();
+            this.fetchAndUpdate(force);
         }, delay);
     }
 
@@ -1010,10 +1122,10 @@ function countValuesBelow(sortedValues, target) {
     return upper;
 }
 
-function createRatingBar(ratings) {
+function createRatingBar(ratings, predictedDifficulty, predictedInnerDifficulty) {
     const bar = createElement('div', {className: 'acs-rate-bar'});
     if (ratings.length < 100) {
-        bar.style.opacity = '0.4';
+        bar.classList.add('is-low-sample');
         bar.title = 'サンプル数が少ないため精度が低い可能性があります';
     }
 
@@ -1025,12 +1137,27 @@ function createRatingBar(ratings) {
         const ratio = (upper - lower) / ratings.length;
         if (ratio <= 0) return;
 
-        const segment = createElement('span');
+        const segment = createElement('span', {className: 'acs-rate-segment'});
         segment.style.width = `${ratio * 100}%`;
         segment.style.background = band.color;
         segment.title = `${band.label}: ${Math.round(ratio * 100)}%`;
         bar.appendChild(segment);
     });
+
+    if (Number.isFinite(predictedDifficulty) && Number.isFinite(predictedInnerDifficulty)) {
+        const percentile = countValuesBelow(ratings, predictedInnerDifficulty) / ratings.length;
+        const markerPosition = Math.min(99, Math.max(1, percentile * 100));
+        const marker = createElement('span', {
+            className: 'acs-difficulty-marker',
+            attributes: {
+                role: 'img',
+                'aria-label': `推定難易度 ${predictedDifficulty}`,
+            },
+        });
+        marker.style.left = `${markerPosition}%`;
+        marker.title = `推定難易度: ${predictedDifficulty}`;
+        bar.appendChild(marker);
+    }
     return bar;
 }
 
@@ -1135,7 +1262,13 @@ function createProblemsPanel() {
                 row.insertCell().textContent = `n=${task.acCount}`;
                 const ratingCell = row.insertCell();
                 const ratings = task.ratings ?? task.rates ?? [];
-                if (ratings.length > 0) ratingCell.appendChild(createRatingBar(ratings));
+                if (ratings.length > 0) {
+                    ratingCell.appendChild(createRatingBar(
+                        ratings,
+                        task.predictedDifficulty,
+                        task.predictedInnerDifficulty,
+                    ));
+                }
                 else ratingCell.textContent = '-';
             });
             return table;
